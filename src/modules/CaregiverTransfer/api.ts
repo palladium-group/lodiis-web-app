@@ -13,7 +13,7 @@ export async function fetchTeiWithRels(engine: any, teiId: string): Promise<TeiM
         fields: [
           "trackedEntityInstance",
           "orgUnit",
-          "attributes[attribute,value]",
+          "attributes[attribute,value,displayName]",
           "enrollments[enrollment,program,orgUnit,status]",
           // explicit edges (some builds still nest them oddly)
           "relationships[relationship,relationshipType,from[trackedEntity,trackedEntityInstance,enrollment,event],to[trackedEntity,trackedEntityInstance,enrollment,event]]",
@@ -23,6 +23,19 @@ export async function fetchTeiWithRels(engine: any, teiId: string): Promise<TeiM
   })) as { tei: any };
 
   return res.tei as TeiMinimal;
+}
+
+/** Lightweight fetch: just attributes for name derivation */
+async function fetchTeiAttributes(engine: any, teiId: string): Promise<Array<{ attribute: string; value: any; displayName?: string }>> {
+  const res = (await engine.query({
+    tei: {
+      resource: `trackedEntityInstances/${teiId}`,
+      params: {
+        fields: "attributes[attribute,value,displayName]",
+      },
+    },
+  })) as { tei: { attributes?: Array<{ attribute: string; value: any; displayName?: string }> } };
+  return res?.tei?.attributes ?? [];
 }
 
 /** ---------- Relationships fetch (GET /relationships …) with guards ---------- */
@@ -123,6 +136,51 @@ function determineDirection(
   return fromCount >= toCount ? "caregiver_to_child" : "child_to_caregiver";
 }
 
+/** ---------- Name derivation from attributes ---------- */
+function pickAttr(attrs: any[], uid?: string) {
+  return uid ? attrs.find(a => a.attribute === uid && a.value != null && `${a.value}`.trim() !== "") : undefined;
+}
+function findByLabel(attrs: any[], regex: RegExp) {
+  return attrs.find(a => regex.test((a.displayName || "").toLowerCase()) && a.value != null && `${a.value}`.trim() !== "");
+}
+function deriveDisplayName(attrs: any[]): string | undefined {
+  if (!Array.isArray(attrs) || attrs.length === 0) return undefined;
+
+  // Config-guided (preferred)
+  const full = pickAttr(attrs, CFG.CHILD_NAME_ATTRS.fullName);
+  if (full) return `${full.value}`.trim();
+
+  const fn = pickAttr(attrs, CFG.CHILD_NAME_ATTRS.firstName);
+  const ln = pickAttr(attrs, CFG.CHILD_NAME_ATTRS.surname);
+  if (fn || ln) return [fn?.value, ln?.value].filter(Boolean).join(" ").trim();
+
+  // Heuristics (if config UIDs not provided)
+  const aFirst = findByLabel(attrs, /\b(first|given|forename)\b/);
+  const aLast  = findByLabel(attrs, /\b(last|surname|family)\b/);
+  if (aFirst || aLast) return [aFirst?.value, aLast?.value].filter(Boolean).join(" ").trim();
+
+  const aName  = findByLabel(attrs, /\bname\b/);
+  if (aName) return `${aName.value}`.trim();
+
+  return undefined;
+}
+
+/** Enrich a list of children with names (parallelized) */
+async function enrichChildrenWithNames(engine: any, children: Array<{ childTei: string; selected: boolean; existingRelId?: string; name?: string }>) {
+  const results = await Promise.all(
+    children.map(async (c) => {
+      try {
+        const attrs = await fetchTeiAttributes(engine, c.childTei);
+        const name = deriveDisplayName(attrs);
+        return { ...c, name };
+      } catch {
+        return c;
+      }
+    })
+  );
+  return results;
+}
+
 /** ---------- Parse children from relationship array ---------- */
 export function getChildrenUnderCaregiver(
   caregiver: TeiMinimal,
@@ -150,24 +208,23 @@ export function getChildrenUnderCaregiver(
 }
 
 /** ---------- Create / Delete relationships ---------- */
-/** Build a Tracker Importer RelationshipItem for a TEI endpoint. */
 function trackerRelItemTei(uid: string) {
-  // Tracker Importer expects nested typed objects, e.g.
-  // { from: { trackedEntity: { trackedEntity: "UID" } }, to: { trackedEntity: { trackedEntity: "UID" } } }
+  // Tracker Importer nested TEI object:
+  // { trackedEntity: { trackedEntity: "UID" } }
   return { trackedEntity: { trackedEntity: uid } };
 }
 
 /**
  * Create a relationship:
- * 1) Prefer Tracker Importer bundle (POST /tracker) with NESTED TEI objects (fixes your 500 error)
- * 2) Fallback to legacy /relationships using 'trackedEntity'
- * 3) Fallback to legacy /relationships using 'trackedEntityInstance'
+ * 1) Tracker Importer bundle (POST /tracker) with nested TEI objects
+ * 2) Fallback to legacy /relationships with 'trackedEntity'
+ * 3) Fallback to legacy /relationships with 'trackedEntityInstance'
  */
 export async function createRelationship(
   engine: any,
   p: { relationshipType: string; fromTei: string; toTei: string }
 ) {
-  // --- Try #1: Tracker Importer (POST /tracker) with nested TEI objects
+  // 1) Tracker Importer
   try {
     const trackerRes: any = await engine.mutate({
       type: "create",
@@ -195,7 +252,7 @@ export async function createRelationship(
       r?.importSummaries?.[0]?.conflicts?.map((c: any) => c?.value)?.join("; ");
     throw new Error(conflicts ? `Tracker relationship rejected: ${conflicts}` : "Tracker relationship rejected");
   } catch {
-    // --- Try #2: Legacy /relationships (trackedEntity)
+    // 2) Legacy /relationships (trackedEntity)
     try {
       return await engine.mutate({
         type: "create",
@@ -207,7 +264,7 @@ export async function createRelationship(
         },
       });
     } catch {
-      // --- Try #3: Legacy /relationships (trackedEntityInstance)
+      // 3) Legacy /relationships (trackedEntityInstance)
       return await engine.mutate({
         type: "create",
         resource: "relationships",
@@ -251,7 +308,7 @@ export async function transferOwnership(engine: any, childTei: string, program: 
   } catch { /* ignore if unsupported */ }
 }
 
-/** ---------- Build plan (embed + merge relationships, detect direction) ---------- */
+/** ---------- Build plan (embed + merge relationships, detect direction, attach names) ---------- */
 export async function planTransfer(
   engine: any,
   oldCaregiverId: string,
@@ -293,10 +350,19 @@ export async function planTransfer(
   const strict = opts?.ignoreTypeFilter ? [] : getChildrenUnderCaregiver(oldCg, { typeFilter: configuredType });
   const chosen = strict && strict.length ? strict : (rels.length ? getChildrenUnderCaregiver(oldCg, { typeFilter: null }) : []);
 
-  const children = chosen.map(({ childTei, relId }) => ({
+  let children: { childTei: string; name: string | undefined; selected: boolean; existingRelId: string | undefined }[] = chosen.map(({ childTei, relId }) => ({
     childTei,
+    name: undefined,
     selected: true,
-    existingRelId: relId,
+    existingRelId: relId ?? undefined,
+  }));
+
+  // === NEW: attach names ===
+  children = (await enrichChildrenWithNames(engine, children)).map(c => ({
+    childTei: c.childTei,
+    name: c.name,
+    selected: c.selected,
+    existingRelId: c.existingRelId ?? undefined,
   }));
 
   return { oldCaregiver: oldCg, newCaregiver: newCg, children, expectedDirection };
