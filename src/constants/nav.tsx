@@ -7,6 +7,8 @@ import { IconDashboardWindow24, IconEditItems24, IconTable24 } from "@dhis2/ui";
 import Details from "../modules/DataManagement/components/Details";
 import { DataManagementOutlet } from "../modules/DataManagement/components/Outlet";
 import { DashboardOutlet } from "../modules/Dashboard/components/Outlet";
+import CaregiverTransfer from "../modules/CaregiverTransfer";
+
 
 export interface NavItem {
 	label?: string;
@@ -55,4 +57,11 @@ export const NAV_ITEMS: NavItem[] = [
 		path: "reports",
 		icon: IconTable24,
 	},
+	{
+  element: CaregiverTransfer,
+  label: i18n.t("Caregiver Transfer"),
+  path: "caregiver-transfer",
+  icon: IconEditItems24,
+},
+
 ];
