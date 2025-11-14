@@ -267,6 +267,31 @@ function getLastServiceFromAnalyticData(
 	return lastService;
 }
 
+/** NEW: get the latest (by eventdate) across multiple stages */
+function getLastServiceFromAnalyticDataAcrossStages(
+	analyticDataByBeneficiary: Array<any>,
+	stages: string[],
+) {
+	let lastService: any = {};
+	const sorted = _.reverse(
+		_.sortBy(
+			_.filter(analyticDataByBeneficiary, (data: any) => {
+				return (
+					data &&
+					data["eventdate"] !== undefined &&
+					data.programStage &&
+					stages.includes(data.programStage)
+				);
+			}),
+			["eventdate"],
+		),
+	);
+	if (sorted.length > 0) {
+		lastService = { ...lastService, ...sorted[0] };
+	}
+	return lastService;
+}
+
 function getLongFormPrEPValue(
 	analyticsDataByBeneficiary: Array<any>,
 	prepFields: Array<string>,
@@ -758,18 +783,14 @@ export function getFormattedEventAnalyticDataForReport(
 									programStage,
 								);
 							} else if (id === "is_service_provided") {
-								const lastService =
-									getLastServiceFromAnalyticData(
-										analyticDataByBeneficiary,
-										programStage,
-									);
-								value =
-									lastService &&
-									_.keys(lastService).length > 0
-										? "Yes"
-										: value === ""
-											? ""
-											: "No";
+								// Use the pre-computed per-TEI flag set in CustomReport
+								const anyYes = _.some(
+									analyticDataByBeneficiary,
+									(d: any) =>
+										`${d["is_service_provided"]}`.toLowerCase() === "yes" ||
+										`${d["SERVICES PROVIDED?"]}`.toLowerCase() === "yes",
+								);
+								value = anyYes ? "Yes" : "No";
 							}
 							if (id === "last_service_community_council") {
 								const lastService: any =
@@ -817,14 +838,26 @@ export function getFormattedEventAnalyticDataForReport(
 										? lastService["eventdate"] || value
 										: value;
 							} else if (id === "date_case_plan") {
-								const lastService: any =
-									getLastServiceFromAnalyticData(
-										analyticDataByBeneficiary,
-										programStage,
-									);
+								// ALWAYS the latest event date of the configured program stage(s),
+								// regardless of selected period (assumes analytics fetch includes all-time for those stages).
+								const configuredStages =
+									_.map(programStages || [], (s: any) => s?.id).filter(Boolean);
+								const candidateStages =
+									(configuredStages.length > 0 ? configuredStages : [programStage]).filter(Boolean);
+
+								const lastService =
+									candidateStages.length > 1
+										? getLastServiceFromAnalyticDataAcrossStages(
+												analyticDataByBeneficiary,
+												candidateStages,
+										  )
+										: getLastServiceFromAnalyticData(
+												analyticDataByBeneficiary,
+												candidateStages[0] || "",
+										  );
+
 								value =
-									lastService &&
-									_.keys(lastService).length > 0
+									lastService && _.keys(lastService).length > 0
 										? lastService["eventdate"] || value
 										: value;
 							} else if (id === "isAgywBeneficiary") {
